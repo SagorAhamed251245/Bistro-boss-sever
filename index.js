@@ -3,6 +3,8 @@ const app = express();
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 require('dotenv').config()
+const stripe = require("stripe")(process.env.PAYMENT_SECRET_KEY);
+
 const port = process.env.PORT || 5000;
 
 // middleware
@@ -48,7 +50,8 @@ async function run() {
     const usersCollection = client.db("bistroDb").collection("users");
     const menuCollection = client.db("bistroDb").collection("menu");
     const reviewCollection = client.db("bistroDb").collection("reviews");
-    const cartCollection = client.db("bistroDb").collection("carts"); 
+    const cartCollection = client.db("bistroDb").collection("carts");
+    const paymentCollection = client.db("bistroDb").collection("payments");
 
     app.post('/jwt', (req, res) => {
       const user = req.body;
@@ -130,15 +133,15 @@ async function run() {
       const result = await menuCollection.find().toArray();
       res.send(result);
     })
-    app.post("/menu", verifyJWT , verifyAdmin,  async (req, res)=> {
-      const newItem= req.body ;
+    app.post("/menu", verifyJWT, verifyAdmin, async (req, res) => {
+      const newItem = req.body;
       const result = await menuCollection.insertOne(newItem);
       res.send(result)
     })
 
     app.delete('/menu/:id', verifyJWT, verifyAdmin, async (req, res) => {
-      const id = req.params.id ;
-      const query = {_id: new ObjectId(id)};
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
       const result = await menuCollection.deleteOne(query);
       res.send(result)
     })
@@ -150,7 +153,7 @@ async function run() {
       res.send(result);
     })
 
-    
+
 
     // cart collection apis
     app.get('/carts', verifyJWT, async (req, res) => {
@@ -182,6 +185,104 @@ async function run() {
       const result = await cartCollection.deleteOne(query);
       res.send(result);
     })
+
+    app.post('/create-payment-intent', verifyJWT, async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: 'usd',
+        payment_method_types: ['card']
+      });
+
+      res.send({
+        clientSecret: paymentIntent.client_secret
+      })
+    })
+
+    app.post('/payments', verifyJWT, async (req, res) => {
+      const payment = req.body;
+      const insertResult = await paymentCollection.insertOne(payment);
+
+      const query = { _id: { $in: payment.cartItems.map(id => new ObjectId(id)) } }
+      const deleteResult = await cartCollection.deleteMany(query)
+
+      res.send({ insertResult, deleteResult });
+    })
+
+    app.get('/admin-stats', verifyJWT, verifyAdmin, async (req, res) => {
+      const users = await usersCollection.estimatedDocumentCount();
+      const products = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+      // best way to get sum of the price field is to use group and sum operator
+      /*
+        await paymentCollection.aggregate([
+          {
+            $group: {
+              _id: null,
+              total: { $sum: '$price' }
+            }
+          }
+        ]).toArray()
+      */
+      const payments = await paymentCollection.find().toArray();
+      const revenue = payments.reduce((sum, payment) => sum + payment.price, 0)
+      res.send({
+        users,
+        products,
+        orders,
+        revenue
+
+      })
+    });
+
+    /**
+    * ---------------
+    * BANGLA SYSTEM(second best solution)
+    * ---------------
+    * 1. load all payments
+    * 2. for each payment, get the menuItems array
+    * 3. for each item in the menuItems array get the menuItem from the menu collection
+    * 4. put them in an array: allOrderedItems
+    * 5. separate allOrderedItems by category using filter
+    * 6. now get the quantity by using length: pizzas.length
+    * 7. for each category use reduce to get the total amount spent on this category
+    * 
+   */
+
+    app.get('/order-stats', verifyJWT, verifyAdmin, async (req, res) => {
+      const pipeline = [
+        {
+          $lookup: {
+            from: 'menu',
+            localField: 'menuItems',
+            foreignField: '_id',
+            as: 'menuItemsData'
+          }
+        },
+        {
+          $unwind: '$menuItemsData'
+        },
+        {
+          $group: {
+            _id: '$menuItemsData.category',
+            count: { $sum: 1 },
+            total: { $sum: '$menuItemsData.price' }
+          }
+        },
+        {
+          $project: {
+            category: '$_id',
+            count: 1,
+            total: { $round: ['$total', 2] },
+            _id: 0
+          }
+        }
+      ];
+      const result = await paymentCollection.aggregate(pipeline).toArray()
+      res.send(result)
+    })
+
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
